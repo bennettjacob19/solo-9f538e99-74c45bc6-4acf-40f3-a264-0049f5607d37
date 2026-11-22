@@ -4,11 +4,16 @@ Workflow per request:
 
 1. The client posts a ``.c`` source, flat groups of ``.h`` headers (one
    directory per group) and the directory search order.
-2. Headers are materialised on disk; GCC compiles the source with
-   ``-MMD -MP`` so the emitted ``.d`` dependency file records *every
-   transitively included* header that was actually used, including headers
-   selected through ``#if``/``#ifdef`` on macro values.
-3. Successful results are cached.  A later request with the same source and
+2. Upload bytes are read and validated per request, while the GCC-facing
+   header bodies are materialised through a process-wide content-addressed
+   store: identical ``(group, file, content)`` uploads share one blob via
+   hard links, different versions get distinct blobs, and each request
+   releases its leases when preparation fails or compilation ends.
+3. GCC compiles the source with ``-MMD -MP`` so the emitted ``.d``
+   dependency file records *every transitively included* header that was
+   actually used, including headers selected through ``#if``/``#ifdef`` on
+   macro values.
+4. Successful results are cached.  A later request with the same source and
    search order is served straight from the cache **without starting GCC** as
    long as every previously used header still exists byte-identically and no
    earlier directory now shadows it with a same-named header.  Unused headers
@@ -33,19 +38,42 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from . import config
+from .shared_store import Lease, SharedHeaderStore, store as shared_store
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI) -> Any:
+    # The shared header area is created lazily; remove it on shutdown.
+    try:
+        yield
+    finally:
+        shared_store.close()
+
 
 app = FastAPI(
     title="C Compilation Cache",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Compile C sources with GCC and serve cached ``.o`` files. Headers are "
         "supplied per request in flat directory groups; only the headers "
         "actually used by the preprocessor are part of the cache key. "
+        "Identical header uploads from parallel requests share a single GCC "
+        "temporary input body inside the instance. "
         "Every response carries an ``X-Cache: HIT|MISS`` header."
     ),
+    lifespan=lifespan,
 )
 
-STATS = {"hits": 0, "misses": 0, "failures": 0}
+STATS = {"hits": 0, "misses": 0, "failures": 0, "prep_failures": 0}
+
+
+class WorkspacePrepError(Exception):
+    """Raised when the per-request workspace cannot be prepared.
+
+    Validation problems still surface as ``422`` via :class:`HTTPException`;
+    this type is reserved for I/O failures whose *reason* must be reported
+    back to the caller.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +163,24 @@ def _temp_workdir() -> Any:
 
 
 def _materialise_headers(
-    workdir: Path, groups: list[str], files: list[UploadFile]
+    workdir: Path,
+    groups: list[str],
+    files: list[UploadFile],
+    leases: list[Lease],
 ) -> dict[str, dict[str, bytes]]:
-    """Write uploaded headers flat under ``workdir/<group>/<file>``.
+    """Stage uploaded headers and place GCC inputs via the shared store.
+
+    Upload bytes are still read and validated per request (each request has
+    its own staging semantics and its own ``contents`` map), but the body
+    GCC sees at ``workdir/<group>/<file>`` is a hard link to one shared
+    blob per distinct ``(group, file, content)`` triple.  Parallel requests
+    uploading byte-identical headers therefore write the body only once;
+    different versions of a same-named header get distinct blobs and run
+    side by side.
+
+    Every acquired lease is appended to ``leases`` so the endpoint can
+    release this request's holds in its ``finally`` block -- including when
+    preparation fails midway.
 
     Returns ``{group: {file_name: content_bytes}}``.
     """
@@ -163,12 +206,26 @@ def _materialise_headers(
             raise HTTPException(
                 status_code=422, detail=f"Duplicate header {group}/{fname}."
             )
+        # Per-request upload staging: bytes are read for this request alone.
         data = _read_upload(up)
         contents[group][fname] = data
-        gdir = workdir / group
-        gdir.mkdir(parents=True, exist_ok=True)
-        (gdir / fname).write_bytes(data)
+
+        destination = workdir / group / fname
+        try:
+            lease = shared_store.acquire(group, fname, data)
+            leases.append(lease)
+            _place_shared_header(lease, destination)
+        except OSError as exc:
+            raise WorkspacePrepError(
+                f"failed to prepare shared header {group}/{fname}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
     return contents
+
+
+def _place_shared_header(lease: Lease, destination: Path) -> None:
+    """Indirection point so tests can simulate a workspace I/O failure."""
+    shared_store.link_into(lease, destination)
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +478,10 @@ def stats() -> dict[str, Any]:
         "cached_entries": len(list(config.CACHE_DIR.glob("*/meta.json")))
         if config.CACHE_DIR.exists()
         else 0,
+        "shared_headers": {
+            "active_blobs": shared_store.active_count(),
+            **shared_store.stats(),
+        },
     }
 
 
@@ -444,6 +505,18 @@ async def compile_endpoint(
         description="Header files uploaded as '<group>/<header.h>'.",
     ),
 ) -> Any:
+    """Compile a source against flat header groups with response caching.
+
+    Parallel requests that upload the same header ``(group, file name,
+    content)`` share one GCC temporary input body (hard links inside each
+    request's own work directory); their upload staging stays independent.
+    Different cache keys still compile in parallel and different versions
+    of a same-named header coexist.  Each request keeps its own directory
+    search order, so dependency records and cache validation are unchanged.
+    A request releases every shared-header hold when preparation fails or
+    once compilation finishes; the shared blob is deleted only after the
+    last user exits.
+    """
     group_list = _parse_header_groups(groups)
     order = _parse_search_order(search_order, group_list)
     define_list = _parse_multi(defines)
@@ -461,96 +534,130 @@ async def compile_endpoint(
 
     download_name = _object_name(source.filename or "source.c")
 
-    with _temp_workdir() as workdir:
-        contents = _materialise_headers(workdir, group_list, headers)
+    # Leases acquired for this request; released unconditionally at the end
+    # (preparation failure or finished compilation). The shared blob itself
+    # disappears only when the last holder releases it.
+    leases: list[Lease] = []
+    try:
+        with _temp_workdir() as workdir:
+            try:
+                contents = _materialise_headers(
+                    workdir, group_list, headers, leases
+                )
+            except WorkspacePrepError as exc:
+                STATS["prep_failures"] += 1
+                return JSONResponse(
+                    status_code=500,
+                    headers={"X-Cache": "MISS", "X-Cache-Reason": "workspace_prep_failed"},
+                    content={"detail": "Workspace preparation failed.", "reason": str(exc)},
+                )
 
-        # ---- Fast path: cache lookup, GCC is never started ---------------
-        cached = _lookup_cached_response(
-            key, order, contents, gcc_version, define_list, flag_list, download_name
-        )
-        if cached is not None:
-            STATS["hits"] += 1
-            return cached
-
-        # ---- Miss: serialise identical keys so concurrent requests only
-        # pay for one GCC invocation and never stream a half-written file.
-        async with config.key_lock(key):
-            # Double-check: another request may have compiled it meanwhile.
+            # ---- Fast path: cache lookup, GCC is never started ---------------
             cached = _lookup_cached_response(
-                key, order, contents, gcc_version, define_list, flag_list,
-                download_name,
+                key, order, contents, gcc_version, define_list, flag_list, download_name
             )
             if cached is not None:
                 STATS["hits"] += 1
                 return cached
 
-            STATS["misses"] += 1
-            (workdir / "source.c").write_bytes(source_bytes)
-            proc, cmd, elapsed_ms = await asyncio.to_thread(
-                _run_gcc, workdir, order, define_list, flag_list
-            )
+            # ---- Miss: serialise identical keys so concurrent requests only
+            # pay for one GCC invocation and never stream a half-written file.
+            async with config.key_lock(key):
+                # Double-check: another request may have compiled it meanwhile.
+                cached = _lookup_cached_response(
+                    key, order, contents, gcc_version, define_list, flag_list,
+                    download_name,
+                )
+                if cached is not None:
+                    STATS["hits"] += 1
+                    return cached
 
-            if proc.returncode == -1:
-                STATS["failures"] += 1
-                return JSONResponse(
-                    status_code=504,
-                    headers={"X-Cache": "MISS"},
-                    content={
-                        "detail": "GCC compilation timed out.",
-                        "command": cmd,
-                    },
+                STATS["misses"] += 1
+                try:
+                    (workdir / "source.c").write_bytes(source_bytes)
+                except OSError as exc:
+                    STATS["prep_failures"] += 1
+                    return JSONResponse(
+                        status_code=500,
+                        headers={
+                            "X-Cache": "MISS",
+                            "X-Cache-Reason": "workspace_prep_failed",
+                        },
+                        content={
+                            "detail": "Workspace preparation failed.",
+                            "reason": f"failed to stage source.c: {type(exc).__name__}: {exc}",
+                        },
+                    )
+                proc, cmd, elapsed_ms = await asyncio.to_thread(
+                    _run_gcc, workdir, order, define_list, flag_list
                 )
 
-            if proc.returncode != 0:
-                # Failures are never cached. Reverting the inputs restores a
-                # HIT on the previously stored object.
-                STATS["failures"] += 1
-                return JSONResponse(
-                    status_code=422,
+                if proc.returncode == -1:
+                    STATS["failures"] += 1
+                    return JSONResponse(
+                        status_code=504,
+                        headers={"X-Cache": "MISS"},
+                        content={
+                            "detail": "GCC compilation timed out.",
+                            "command": cmd,
+                        },
+                    )
+
+                if proc.returncode != 0:
+                    # Failures are never cached. Reverting the inputs restores a
+                    # HIT on the previously stored object.
+                    STATS["failures"] += 1
+                    return JSONResponse(
+                        status_code=422,
+                        headers={
+                            "X-Cache": "MISS",
+                            "X-Cache-Reason": "compilation_failed",
+                        },
+                        content={
+                            "detail": "Compilation failed.",
+                            "command": cmd,
+                            "returncode": proc.returncode,
+                            "stderr": proc.stderr,
+                            "stdout": proc.stdout,
+                            "elapsed_ms": elapsed_ms,
+                        },
+                    )
+
+                obj_path = workdir / "source.o"
+                dep_path = workdir / "source.d"
+                object_bytes = obj_path.read_bytes()
+                dep_headers = _parse_depfile(dep_path, workdir)
+                meta = _build_meta(
+                    workdir,
+                    group_list,
+                    order,
+                    contents,
+                    dep_headers,
+                    gcc_version,
+                    define_list,
+                    flag_list,
+                    _sha256(object_bytes),
+                )
+                # Objects are content-addressed and immutable, so the response can
+                # stream the durable cached file safely even under recompiles.
+                stored = config.store_entry(key, object_bytes, meta)
+                used_names = ",".join(
+                    f"{h['group']}/{h['name']}" for h in meta["used_headers"]
+                )
+                return FileResponse(
+                    stored / "object.o",
+                    media_type="application/x-object",
+                    filename=download_name,
                     headers={
                         "X-Cache": "MISS",
-                        "X-Cache-Reason": "compilation_failed",
-                    },
-                    content={
-                        "detail": "Compilation failed.",
-                        "command": cmd,
-                        "returncode": proc.returncode,
-                        "stderr": proc.stderr,
-                        "stdout": proc.stdout,
-                        "elapsed_ms": elapsed_ms,
+                        "X-Cache-Reason": "compiled",
+                        "X-Cache-Key": key,
+                        "X-Compile-Ms": str(elapsed_ms),
+                        "X-Used-Headers": used_names,
                     },
                 )
-
-            obj_path = workdir / "source.o"
-            dep_path = workdir / "source.d"
-            object_bytes = obj_path.read_bytes()
-            dep_headers = _parse_depfile(dep_path, workdir)
-            meta = _build_meta(
-                workdir,
-                group_list,
-                order,
-                contents,
-                dep_headers,
-                gcc_version,
-                define_list,
-                flag_list,
-                _sha256(object_bytes),
-            )
-            # Objects are content-addressed and immutable, so the response can
-            # stream the durable cached file safely even under recompiles.
-            stored = config.store_entry(key, object_bytes, meta)
-            used_names = ",".join(
-                f"{h['group']}/{h['name']}" for h in meta["used_headers"]
-            )
-            return FileResponse(
-                stored / "object.o",
-                media_type="application/x-object",
-                filename=download_name,
-                headers={
-                    "X-Cache": "MISS",
-                    "X-Cache-Reason": "compiled",
-                    "X-Cache-Key": key,
-                    "X-Compile-Ms": str(elapsed_ms),
-                    "X-Used-Headers": used_names,
-                },
-            )
+    finally:
+        # Release this request's holds no matter how it ended. The shared
+        # blob itself is removed by the store only when the last user exits.
+        for lease in leases:
+            lease.release()

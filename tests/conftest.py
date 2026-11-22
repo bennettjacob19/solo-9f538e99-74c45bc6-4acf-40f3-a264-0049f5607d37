@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app import config  # noqa: E402
 from app.main import app, STATS  # noqa: E402
+from app.shared_store import store as shared_store  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -32,9 +33,12 @@ def _reset_stats_and_cache(cache_dir):
                 shutil.rmtree(child)
             else:
                 child.unlink()
-    STATS.update(hits=0, misses=0, failures=0)
+    STATS.update(hits=0, misses=0, failures=0, prep_failures=0)
     config._invalidation_stats.clear()
+    shared_store.close()
     yield
+    # No lease may leak across tests: every shared blob must be released.
+    assert shared_store.active_count() == 0
 
 
 @pytest.fixture
