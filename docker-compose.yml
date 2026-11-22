@@ -1,0 +1,16 @@
+services:
+  ccache:
+    build: .
+    image: c-compile-cache:latest
+    container_name: c-compile-cache
+    ports:
+      - "8000:8000"
+    volumes:
+      - cache-data:/data/cache
+    environment:
+      CCACHE_CACHE_DIR: /data/cache
+      CCACHE_GCC_TIMEOUT: "30"
+    restart: unless-stopped
+
+volumes:
+  cache-data:
